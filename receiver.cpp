@@ -4,11 +4,16 @@
 #include <vector>
 #include <thread>
 #include <chrono>
-#include <process.h>
+#include <filesystem>
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#include <sys/wait.h>
 #endif
+
+namespace fs = std::filesystem;
 
 class Receiver {
 private:
@@ -16,7 +21,7 @@ private:
     int capacity_;
     int sender_count_;
     MessageQueue queue_;
-    std::vector<HANDLE> sender_processes_;
+    std::vector<PROCESS_INFORMATION> sender_processes_;
 
 public:
     bool run() {
@@ -50,6 +55,37 @@ private:
     }
 
     bool startSenders() {
+        std::string exe_path;
+
+        char buffer[MAX_PATH];
+        GetModuleFileNameA(NULL, buffer, MAX_PATH);
+        fs::path full_path(buffer);
+        fs::path exe_dir = full_path.parent_path();
+
+        fs::path sender_path = exe_dir / "sender.exe";
+
+        if (!fs::exists(sender_path)) {
+            sender_path = "sender.exe";
+            if (!fs::exists(sender_path)) {
+                sender_path = exe_dir / "Debug" / "sender.exe";
+                if (!fs::exists(sender_path)) {
+                    sender_path = exe_dir / "Release" / "sender.exe";
+                    if (!fs::exists(sender_path)) {
+                        std::cerr << "Error: sender.exe not found!" << std::endl;
+                        std::cerr << "Searched in:" << std::endl;
+                        std::cerr << "  " << (exe_dir / "sender.exe").string() << std::endl;
+                        std::cerr << "  " << (fs::current_path() / "sender.exe").string() << std::endl;
+                        std::cerr << "  " << (exe_dir / "Debug" / "sender.exe").string() << std::endl;
+                        std::cerr << "  " << (exe_dir / "Release" / "sender.exe").string() << std::endl;
+                        return false;
+                    }
+                }
+            }
+        }
+
+        exe_path = sender_path.string();
+        std::cout << "Using sender executable: " << exe_path << std::endl;
+
         for (int i = 0; i < sender_count_; ++i) {
             STARTUPINFOA si;
             PROCESS_INFORMATION pi;
@@ -58,25 +94,35 @@ private:
             si.cb = sizeof(si);
             ZeroMemory(&pi, sizeof(pi));
 
-            std::string cmd = "sender.exe " + filename_;
+            std::string cmd = "\"" + exe_path + "\" \"" + filename_ + "\"";
+
+            std::cout << "Starting command: " << cmd << std::endl;
 
             if (!CreateProcessA(
-                NULL,
+                exe_path.c_str(),
                 const_cast<char*>(cmd.c_str()),
                 NULL,
                 NULL,
                 FALSE,
-                0,
+                CREATE_NEW_CONSOLE,
                 NULL,
-                NULL,
+                NULL, 
                 &si,
                 &pi)
                 ) {
-                std::cerr << "CreateProcess failed: " << GetLastError() << std::endl;
+                DWORD error = GetLastError();
+                std::cerr << "CreateProcess failed! Error: " << error << std::endl;
+
+                if (error == ERROR_FILE_NOT_FOUND) {
+                    std::cerr << "File not found: " << exe_path << std::endl;
+                }
+                else if (error == ERROR_PATH_NOT_FOUND) {
+                    std::cerr << "Path not found for: " << exe_path << std::endl;
+                }
                 return false;
             }
 
-            sender_processes_.push_back(pi.hProcess);
+            sender_processes_.push_back(pi);
             std::cout << "Started Sender process PID: " << pi.dwProcessId << std::endl;
 
             CloseHandle(pi.hThread);
@@ -112,11 +158,15 @@ private:
     }
 
     void cleanup() {
-        for (HANDLE process : sender_processes_) {
-            TerminateProcess(process, 0);
-            WaitForSingleObject(process, INFINITE);
-            CloseHandle(process);
+        std::cout << "Terminating sender processes..." << std::endl;
+        for (auto& pi : sender_processes_) {
+            if (pi.hProcess) {
+                TerminateProcess(pi.hProcess, 0);
+                WaitForSingleObject(pi.hProcess, 5000);
+                CloseHandle(pi.hProcess);
+            }
         }
+        sender_processes_.clear();
     }
 };
 

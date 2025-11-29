@@ -5,6 +5,9 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <vector>
+#include <windows.h>
+#include <tchar.h>
 
 constexpr int MAX_MESSAGE_LENGTH = 20;
 
@@ -13,7 +16,10 @@ struct Message {
     bool is_empty;
     char text[MAX_MESSAGE_LENGTH];
 
-    Message() : is_empty(true) { text[0] = '\0'; }
+    Message() : is_empty(true) {
+        memset(text, 0, sizeof(text));
+    }
+
     Message(const std::string& str) : is_empty(false) {
         strncpy(text, str.c_str(), MAX_MESSAGE_LENGTH - 1);
         text[MAX_MESSAGE_LENGTH - 1] = '\0';
@@ -36,7 +42,121 @@ class MessageQueue {
 private:
     std::string filename;
     QueueHeader header;
-    bool is_open;
+
+    HANDLE hSemEmpty;
+    HANDLE hSemFull;
+    HANDLE hMutex;
+
+    std::string getSemaphoreName(const std::string& base, const std::string& type) {
+        return "Global\\" + base + "_" + type;
+    }
+
+    bool createSyncObjects() {
+        std::string base_name = filename;
+        for (char& c : base_name) {
+            if (c == ':' || c == '\\' || c == '/') c = '_';
+        }
+
+        hSemEmpty = CreateSemaphoreA(
+            NULL,
+            header.capacity,
+            header.capacity,
+            getSemaphoreName(base_name, "empty").c_str()
+        );
+
+        if (hSemEmpty == NULL) {
+            std::cerr << "Failed to create empty semaphore. Error: " << GetLastError() << std::endl;
+            return false;
+        }
+
+        hSemFull = CreateSemaphoreA(
+            NULL,
+            0,
+            header.capacity,
+            getSemaphoreName(base_name, "full").c_str()
+        );
+
+        if (hSemFull == NULL) {
+            std::cerr << "Failed to create full semaphore. Error: " << GetLastError() << std::endl;
+            CloseHandle(hSemEmpty);
+            return false;
+        }
+
+        hMutex = CreateMutexA(
+            NULL,
+            FALSE,
+            getSemaphoreName(base_name, "mutex").c_str()
+        );
+
+        if (hMutex == NULL) {
+            std::cerr << "Failed to create mutex. Error: " << GetLastError() << std::endl;
+            CloseHandle(hSemEmpty);
+            CloseHandle(hSemFull);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool openSyncObjects() {
+        std::string base_name = filename;
+        for (char& c : base_name) {
+            if (c == ':' || c == '\\' || c == '/') c = '_';
+        }
+
+        hSemEmpty = OpenSemaphoreA(
+            SEMAPHORE_ALL_ACCESS,
+            FALSE,
+            getSemaphoreName(base_name, "empty").c_str()
+        );
+
+        if (hSemEmpty == NULL) {
+            std::cerr << "Failed to open empty semaphore. Error: " << GetLastError() << std::endl;
+            return false;
+        }
+
+        hSemFull = OpenSemaphoreA(
+            SEMAPHORE_ALL_ACCESS,
+            FALSE,
+            getSemaphoreName(base_name, "full").c_str()
+        );
+
+        if (hSemFull == NULL) {
+            std::cerr << "Failed to open full semaphore. Error: " << GetLastError() << std::endl;
+            CloseHandle(hSemEmpty);
+            return false;
+        }
+
+        hMutex = OpenMutexA(
+            MUTEX_ALL_ACCESS,
+            FALSE,
+            getSemaphoreName(base_name, "mutex").c_str()
+        );
+
+        if (hMutex == NULL) {
+            std::cerr << "Failed to open mutex. Error: " << GetLastError() << std::endl;
+            CloseHandle(hSemEmpty);
+            CloseHandle(hSemFull);
+            return false;
+        }
+
+        return true;
+    }
+
+    void closeSyncObjects() {
+        if (hSemEmpty != NULL) {
+            CloseHandle(hSemEmpty);
+            hSemEmpty = NULL;
+        }
+        if (hSemFull != NULL) {
+            CloseHandle(hSemFull);
+            hSemFull = NULL;
+        }
+        if (hMutex != NULL) {
+            CloseHandle(hMutex);
+            hMutex = NULL;
+        }
+    }
 
     bool readHeader() {
         std::ifstream file(filename, std::ios::binary);
@@ -54,14 +174,21 @@ private:
     }
 
 public:
-    MessageQueue() : is_open(false), header{ 0,0,0,0 } {}
+    MessageQueue() : hSemEmpty(NULL), hSemFull(NULL), hMutex(NULL), header{ 0, 0, 0, 0 } {}
+
+    ~MessageQueue() {
+        closeSyncObjects();
+    }
 
     bool create(const std::string& fname, int capacity) {
         filename = fname;
         header = { capacity, 0, 0, 0 };
 
         std::ofstream file(filename, std::ios::binary | std::ios::trunc);
-        if (!file) return false;
+        if (!file) {
+            std::cerr << "Failed to create file: " << filename << std::endl;
+            return false;
+        }
 
         file.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
@@ -70,60 +197,199 @@ public:
             file.write(reinterpret_cast<const char*>(&empty_msg), sizeof(Message));
         }
 
-        is_open = file.good();
-        return is_open;
+        if (!file.good()) {
+            std::cerr << "Failed to write initial data to file" << std::endl;
+            return false;
+        }
+        file.close();
+
+        if (!createSyncObjects()) {
+            return false;
+        }
+
+        return true;
     }
 
     bool open(const std::string& fname) {
         filename = fname;
-        is_open = readHeader();
-        return is_open;
-    }
 
-    bool write(const std::string& message) {
-        if (!is_open || isFull()) return false;
+        if (!readHeader()) {
+            std::cerr << "Failed to read queue header from: " << filename << std::endl;
+            return false;
+        }
 
-        std::fstream file(filename, std::ios::binary | std::ios::in | std::ios::out);
-        if (!file) return false;
+        if (!openSyncObjects()) {
+            std::cerr << "Failed to open synchronization objects for: " << filename << std::endl;
+            return false;
+        }
 
-        Message msg(message);
-
-        file.seekp(sizeof(QueueHeader) + header.tail * sizeof(Message));
-        file.write(reinterpret_cast<const char*>(&msg), sizeof(Message));
-
-        header.tail = (header.tail + 1) % header.capacity;
-        header.count++;
-
-        writeHeader();
         return true;
     }
 
-    Message read() {
-        Message msg;
-        if (!is_open || isEmpty()) return msg;
+    bool write(const std::string& message, DWORD timeout = INFINITE) {
+        DWORD waitResult = WaitForSingleObject(hSemEmpty, timeout);
+        if (waitResult != WAIT_OBJECT_0) {
+            if (waitResult == WAIT_TIMEOUT) {
+                std::cerr << "Timeout waiting for empty slot" << std::endl;
+            }
+            else {
+                std::cerr << "Failed to wait for empty semaphore. Error: " << GetLastError() << std::endl;
+            }
+            return false;
+        }
 
-        std::fstream file(filename, std::ios::binary | std::ios::in | std::ios::out);
-        if (!file) return msg;
+        waitResult = WaitForSingleObject(hMutex, timeout);
+        if (waitResult != WAIT_OBJECT_0) {
+            ReleaseSemaphore(hSemEmpty, 1, NULL);
+            return false;
+        }
 
-        file.seekg(sizeof(QueueHeader) + header.head * sizeof(Message));
-        file.read(reinterpret_cast<char*>(&msg), sizeof(Message));
+        bool success = false;
+        do {
+            std::fstream file(filename, std::ios::binary | std::ios::in | std::ios::out);
+            if (!file) {
+                std::cerr << "Failed to open file for writing" << std::endl;
+                break;
+            }
 
-        if (!msg.is_empty) {
-            msg.is_empty = true;
-            file.seekp(sizeof(QueueHeader) + header.head * sizeof(Message));
+            Message msg(message);
+
+            file.seekp(sizeof(QueueHeader) + header.tail * sizeof(Message));
             file.write(reinterpret_cast<const char*>(&msg), sizeof(Message));
 
-            header.head = (header.head + 1) % header.capacity;
-            header.count--;
-            writeHeader();
+            header.tail = (header.tail + 1) % header.capacity;
+            header.count++;
+
+            file.seekp(0);
+            file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+            if (!file.good()) {
+                std::cerr << "Failed to write to file" << std::endl;
+                break;
+            }
+
+            success = true;
+        } while (false);
+
+        ReleaseMutex(hMutex);
+
+        if (success) {
+            if (!ReleaseSemaphore(hSemFull, 1, NULL)) {
+                std::cerr << "Failed to release full semaphore. Error: " << GetLastError() << std::endl;
+            }
+        }
+        else {
+            ReleaseSemaphore(hSemEmpty, 1, NULL);
+        }
+
+        return success;
+    }
+
+    Message read(DWORD timeout = INFINITE) {
+        Message msg;
+
+        DWORD waitResult = WaitForSingleObject(hSemFull, timeout);
+        if (waitResult != WAIT_OBJECT_0) {
+            if (waitResult == WAIT_TIMEOUT) {
+                std::cerr << "Timeout waiting for message" << std::endl;
+            }
+            else {
+                std::cerr << "Failed to wait for full semaphore. Error: " << GetLastError() << std::endl;
+            }
+            return msg;
+        }
+
+        waitResult = WaitForSingleObject(hMutex, timeout);
+        if (waitResult != WAIT_OBJECT_0) {
+            ReleaseSemaphore(hSemFull, 1, NULL);
+            return msg;
+        }
+
+        do {
+            std::fstream file(filename, std::ios::binary | std::ios::in | std::ios::out);
+            if (!file) {
+                std::cerr << "Failed to open file for reading" << std::endl;
+                break;
+            }
+
+            file.seekg(sizeof(QueueHeader) + header.head * sizeof(Message));
+            file.read(reinterpret_cast<char*>(&msg), sizeof(Message));
+
+            if (!msg.is_empty) {
+                msg.is_empty = true;
+                file.seekp(sizeof(QueueHeader) + header.head * sizeof(Message));
+                file.write(reinterpret_cast<const char*>(&msg), sizeof(Message));
+
+                header.head = (header.head + 1) % header.capacity;
+                header.count--;
+
+                file.seekp(0);
+                file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+                if (!file.good()) {
+                    std::cerr << "Failed to update file after reading" << std::endl;
+                    msg.is_empty = true;
+                    break;
+                }
+            }
+        } while (false);
+
+        ReleaseMutex(hMutex);
+
+        if (!msg.is_empty) {
+            if (!ReleaseSemaphore(hSemEmpty, 1, NULL)) {
+                std::cerr << "Failed to release empty semaphore. Error: " << GetLastError() << std::endl;
+            }
+        }
+        else {
+            ReleaseSemaphore(hSemFull, 1, NULL);
         }
 
         return msg;
     }
 
-    bool isEmpty() const { return header.count == 0; }
-    bool isFull() const { return header.count >= header.capacity; }
-    void close() { is_open = false; }
+    bool isEmpty() const {
+        return header.count == 0;
+    }
+
+    bool isFull() const {
+        return header.count >= header.capacity;
+    }
+
+    int getCapacity() const {
+        return header.capacity;
+    }
+
+    int getCount() const {
+        return header.count;
+    }
 };
+
+inline bool startSenderProcess(const std::string& filename, PROCESS_INFORMATION& pi) {
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    std::string command = "sender.exe \"" + filename + "\"";
+
+    if (!CreateProcessA(
+        NULL,
+        const_cast<char*>(command.c_str()),
+        NULL,
+        NULL,
+        FALSE,
+        0,
+        NULL,
+        NULL,
+        &si,
+        &pi
+    )) {
+        std::cerr << "CreateProcess failed. Error: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    return true;
+}
 
 #endif
